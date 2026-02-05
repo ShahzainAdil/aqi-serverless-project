@@ -1,0 +1,14 @@
+pymongo
+dnspython
+certifi
+pandas
+numpy
+scikit-learn
+xgboost
+streamlit
+python-dotenv
+requests
+matplotlib
+seaborn
+joblib
+shap
