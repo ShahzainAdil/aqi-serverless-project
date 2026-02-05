@@ -12,3 +12,7 @@ matplotlib
 seaborn
 joblib
 shap
+openmeteo-requests
+requests-cache
+retry-requests
+altair
