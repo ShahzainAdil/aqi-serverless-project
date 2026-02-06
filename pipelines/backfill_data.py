@@ -1,106 +1,97 @@
+import openmeteo_requests
+import requests_cache
+import pandas as pd
+from retry_requests import retry
+import pymongo
+import certifi
 import os
 import datetime
-import requests
-import pandas as pd
 from dotenv import load_dotenv
-from pymongo import MongoClient
-import certifi
 
+# 1. Setup Database Connection
 load_dotenv()
-
 MONGO_URI = os.getenv("MONGO_URI")
-if not MONGO_URI:
-    raise SystemExit("MONGO_URI not found in environment")
+client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+db = client["aqi_project_db"]
+collection = db["features"]
 
-LAT = 24.8607
-LON = 67.0011
+# Setup Open-Meteo API Client
+cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+openmeteo = openmeteo_requests.Client(session=retry_session)
 
-def get_collection():
-    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-    db = client.get_database("aqi_project_db")
-    return db.get_collection("features")
-
-def fetch_weather(start_date: str, end_date: str):
-    url = "https://archive-api.open-meteo.com/v1/archive"
-    params = {
-        "latitude": LAT,
-        "longitude": LON,
-        "start_date": start_date,
-        "end_date": end_date,
-        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m",
-        "timezone": "UTC",
+def fetch_latest_hour():
+    print("📡 Connecting to Open-Meteo for latest data...")
+    
+    # 2. Coordinates for Karachi
+    LAT = 24.8607
+    LON = 67.0011
+    
+    # We ask for "past_days=1" to ensure we get the most recent completed hour
+    url_aq = "https://air-quality-api.open-meteo.com/v1/air-quality"
+    params_aq = {
+        "latitude": LAT, "longitude": LON,
+        "hourly": ["pm2_5", "pm10", "nitrogen_dioxide"],
+        "past_days": 1
     }
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("hourly", {})
-
-def fetch_air_quality(start_date: str, end_date: str):
-    url = "https://air-quality-api.open-meteo.com/v1/air-quality"
-    params = {
-        "latitude": LAT,
-        "longitude": LON,
-        "start_date": start_date,
-        "end_date": end_date,
-        "hourly": "pm2_5,pm10,nitrogen_dioxide",
-        "timezone": "UTC",
+    
+    url_w = "https://api.open-meteo.com/v1/forecast"
+    params_w = {
+        "latitude": LAT, "longitude": LON,
+        "hourly": ["temperature_2m", "relative_humidity_2m", "wind_speed_10m"],
+        "past_days": 1
     }
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("hourly", {})
 
-def build_records(weather_hourly: dict, air_hourly: dict):
-    times = weather_hourly.get("time", [])
-    # Build mapping for air times -> index
-    air_time_index = {t: i for i, t in enumerate(air_hourly.get("time", []))}
-    records = []
-    for i, t in enumerate(times):
-        try:
-            temp = weather_hourly.get("temperature_2m", [None])[i]
-            humidity = weather_hourly.get("relative_humidity_2m", [None])[i]
-            wind_speed = weather_hourly.get("wind_speed_10m", [None])[i]
+    try:
+        # Fetch Air Quality
+        aq_resp = openmeteo.weather_api(url_aq, params=params_aq)[0]
+        hourly_aq = aq_resp.Hourly()
+        
+        # Fetch Weather
+        w_resp = openmeteo.weather_api(url_w, params=params_w)[0]
+        hourly_w = w_resp.Hourly()
 
-            air_idx = air_time_index.get(t)
-            if air_idx is None:
-                continue
-            pm2_5 = air_hourly.get("pm2_5", [None])[air_idx]
-            pm10 = air_hourly.get("pm10", [None])[air_idx]
-            no2 = air_hourly.get("nitrogen_dioxide", [None])[air_idx]
+        # 3. Create DataFrame
+        dates = pd.date_range(
+            start=pd.to_datetime(hourly_aq.Time(), unit="s", utc=True),
+            end=pd.to_datetime(hourly_aq.TimeEnd(), unit="s", utc=True),
+            freq=pd.Timedelta(seconds=hourly_aq.Interval()),
+            inclusive="left"
+        )
+        
+        df = pd.DataFrame({
+            "timestamp": dates,
+            "pm2_5": hourly_aq.Variables(0).ValuesAsNumpy(),
+            "pm10": hourly_aq.Variables(1).ValuesAsNumpy(),
+            "no2": hourly_aq.Variables(2).ValuesAsNumpy(),
+            "temp": hourly_w.Variables(0).ValuesAsNumpy(),
+            "humidity": hourly_w.Variables(1).ValuesAsNumpy(),
+            "wind_speed": hourly_w.Variables(2).ValuesAsNumpy()
+        })
+        
+        # 4. Filter for ONLY the current/latest hour
+        # We grab the last row that isn't in the future
+        now = pd.Timestamp.now(tz='UTC')
+        current_data = df[df['timestamp'] <= now].iloc[-1:]
+        
+        current_data["hour"] = current_data["timestamp"].dt.hour
+        
+        # 5. Push to MongoDB (Append Mode)
+        if not current_data.empty:
+            record = current_data.to_dict("records")[0]
+            
+            # Upsert: Update if exists, Insert if new (prevents duplicates)
+            collection.update_one(
+                {"timestamp": record["timestamp"]}, 
+                {"$set": record}, 
+                upsert=True
+            )
+            print(f"✅ Successfully added data for: {record['timestamp']}")
+        else:
+            print("⚠️ No valid past data found in response.")
 
-            # Skip if any value is None / NaN
-            values = [pm2_5, pm10, no2, temp, humidity, wind_speed]
-            if any(pd.isna(v) for v in values):
-                continue
-
-            ts = pd.to_datetime(t, utc=True).to_pydatetime()
-            rec = {
-                "timestamp": ts,
-                "pm2_5": float(pm2_5),
-                "pm10": float(pm10),
-                "no2": float(no2),
-                "temp": float(temp),
-                "humidity": float(humidity),
-                "wind_speed": float(wind_speed),
-            }
-            records.append(rec)
-        except (IndexError, TypeError, ValueError):
-            continue
-    return records
-
-def main():
-    end_date = datetime.date.today().isoformat()
-    start_date = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
-
-    weather_hourly = fetch_weather(start_date, end_date)
-    air_hourly = fetch_air_quality(start_date, end_date)
-
-    records = build_records(weather_hourly, air_hourly)
-    if not records:
-        print("No valid records found to insert.")
-        return
-
-    coll = get_collection()
-    result = coll.insert_many(records)
-    print(f"✅ Successfully inserted {len(result.inserted_ids)} rows of real history")
+    except Exception as e:
+        print(f"❌ Error in feature pipeline: {e}")
 
 if __name__ == "__main__":
-    main()
+    fetch_latest_hour()

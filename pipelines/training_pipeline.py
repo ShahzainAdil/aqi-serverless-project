@@ -1,122 +1,96 @@
+import dns.resolver
 import os
+import pandas as pd
+import pymongo
+import certifi
 import pickle
 import datetime
-import pandas as pd
-from dotenv import load_dotenv
-from pymongo import MongoClient
-import certifi
-
-# Import 3 different models
+import numpy as np
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from dotenv import load_dotenv
 
+# --- 1. DNS PATCH ---
+dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
+dns.resolver.default_resolver.nameservers = ['8.8.8.8']
+
+# 2. Setup
 load_dotenv()
-
 MONGO_URI = os.getenv("MONGO_URI")
 
-def get_database():
-    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-    return client.get_database("aqi_project_db")
+client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+db = client["aqi_project_db"]
+feature_collection = db["features"]
+model_collection = db["model_registry"]
 
-def load_dataframe(db) -> pd.DataFrame:
-    collection = db.get_collection("features")
-    docs = list(collection.find({}))
-    if not docs:
-        return pd.DataFrame()
-    df = pd.DataFrame(docs)
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    return df.sort_values("timestamp").reset_index(drop=True)
+def train_and_save():
+    print("🥊 Starting Daily Model Tournament...")
+    
+    # 3. Fetch Data
+    data = list(feature_collection.find())
+    if not data:
+        print("❌ No data found!")
+        return
 
-def prepare_features(df: pd.DataFrame):
-    df = df.copy()
-    # Target: PM2.5 in the NEXT hour
-    df["target_pm2_5"] = df["pm2_5"].shift(-1)
-    df = df.iloc[:-1].reset_index(drop=True)
+    df = pd.DataFrame(data)
     
-    # Feature Engineering: Add "Hour" column
-    df["hour"] = df["timestamp"].dt.hour
+    # Clean Data
+    required_cols = ["pm2_5", "temp", "humidity", "wind_speed", "hour"]
+    df = df.dropna(subset=required_cols)
     
-    features = ["pm2_5", "pm10", "no2", "temp", "humidity", "wind_speed", "hour"]
-    df = df[features + ["target_pm2_5"]]
-    df = df.dropna()
+    # 4. Prepare Features
+    X = df[["temp", "humidity", "wind_speed", "hour"]]
+    y = df["pm2_5"]
     
-    X = df[features]
-    y = df["target_pm2_5"]
-    return X, y
-
-def train_and_evaluate(db, X, y):
-    # Split Data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    # Define the 3 Contenders
+    # 5. The Tournament
     models = {
         "Linear Regression": LinearRegression(),
         "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42),
         "Gradient Boosting": GradientBoostingRegressor(n_estimators=100, random_state=42)
     }
     
-    best_model_name = None
-    best_mae = float("inf")
-    best_model_obj = None
+    best_name = None
+    best_model = None
+    best_r2 = -float("inf") # We want to maximize R2
+    best_metrics = {}
     
-    print(f"🥊 Starting Model Tournament with {len(X)} records...")
-    print("-" * 40)
+    print("-" * 75)
+    print(f"{'Model':<20} | {'MAE':<10} | {'RMSE':<10} | {'R2 Score':<10}")
+    print("-" * 75)
 
-    results = []
-
-    # Train and Evaluate each
     for name, model in models.items():
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        mae = mean_absolute_error(y_test, preds)
+        model.fit(X, y)
+        preds = model.predict(X)
         
-        print(f"   🏃 {name}: MAE = ±{mae:.4f}")
+        # --- NEW METRICS ---
+        mae = mean_absolute_error(y, preds)
+        rmse = np.sqrt(mean_squared_error(y, preds))
+        r2 = r2_score(y, preds)
         
-        results.append({
-            "model_name": name,
-            "mae": mae,
-            "trained_at": datetime.datetime.utcnow()
-        })
+        print(f"{name:<20} | {mae:.4f}     | {rmse:.4f}     | {r2:.4f}")
         
-        # Check if this is the new winner
-        if mae < best_mae:
-            best_mae = mae
-            best_model_name = name
-            best_model_obj = model
+        # We choose the winner based on R2 (Accuracy)
+        if r2 > best_r2:
+            best_r2 = r2
+            best_name = name
+            best_model = model
+            best_metrics = {"mae": mae, "rmse": rmse, "r2": r2}
+            
+    print("-" * 75)
+    print(f"🏆 WINNER: {best_name} (Accuracy: {best_metrics['r2']*100:.2f}%)")
 
-    print("-" * 40)
-    print(f"🏆 WINNER: {best_model_name} (Error: ±{best_mae:.4f})")
-    
-    # 1. Save the Winner to File (for the App to use)
-    with open("aqi_model.pkl", "wb") as f:
-        pickle.dump(best_model_obj, f)
-        
-    # 2. Log the Tournament Results to MongoDB (Model Registry)
-    registry_collection = db.get_collection("model_registry")
-    
-    # Create a registry document
-    registry_doc = {
-        "experiment_date": datetime.datetime.utcnow(),
-        "winner": best_model_name,
-        "winner_mae": best_mae,
-        "candidates": results
+    # 6. Save Winner
+    model_data = {
+        "model_name": best_name,
+        "timestamp": datetime.datetime.now(),
+        "metrics": best_metrics,
+        "model_binary": pickle.dumps(best_model)
     }
-    registry_collection.insert_one(registry_doc)
-    print("✅ Model Registry updated in MongoDB.")
-
-def main():
-    db = get_database()
-    df = load_dataframe(db)
     
-    if df.empty:
-        print("No data found.")
-        return
-        
-    X, y = prepare_features(df)
-    train_and_evaluate(db, X, y)
+    model_collection.delete_many({}) 
+    model_collection.insert_one(model_data)
+    print("✅ Champion Model saved to Registry!")
 
 if __name__ == "__main__":
-    main()
+    train_and_save()
