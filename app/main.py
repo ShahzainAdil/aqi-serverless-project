@@ -121,4 +121,22 @@ with tab2:
     hist_df = get_historical_data()
     if not hist_df.empty:
         st.subheader("Pollution Trend (Last 30 Days)")
-        st.altair_chart(alt.Chart(hist_df).mark_line().encode(x='timestamp:T', y='pm2_5:Q').properties(height=300), use_container_
+        
+        # 1. Line Chart (Trend)
+        chart_trend = alt.Chart(hist_df).mark_line().encode(
+            x=alt.X('timestamp:T', title='Time'), 
+            y=alt.Y('pm2_5:Q', title='PM2.5')
+        ).properties(height=300)
+        
+        st.altair_chart(chart_trend, use_container_width=True)
+        
+        st.subheader("Correlations")
+        
+        # 2. Scatter Chart (Wind vs Pollution)
+        chart_corr = alt.Chart(hist_df).mark_circle().encode(
+            x=alt.X('wind_speed:Q', title='Wind Speed'), 
+            y=alt.Y('pm2_5:Q', title='PM2.5'), 
+            color='temp:Q'
+        ).properties(height=300)
+        
+        st.altair_chart(chart_corr, use_container_width=True)
