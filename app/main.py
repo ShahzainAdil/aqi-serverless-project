@@ -187,7 +187,7 @@ with tab_eda:
 
         # 2. Correlation Scatter (Wind vs PM2.5)
         st.subheader("2. Correlation: Wind Speed vs. Pollution")
-        st.markdown("*Does high wind blow the smog away?*")
+        
         
         chart_corr = alt.Chart(historical_df).mark_circle(size=60).encode(
             x=alt.X('wind_speed:Q', title='Wind Speed (km/h)'),
