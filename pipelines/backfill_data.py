@@ -3,95 +3,121 @@ import requests_cache
 import pandas as pd
 from retry_requests import retry
 import pymongo
-import certifi
 import os
-import datetime
+import certifi
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
-# 1. Setup Database Connection
+# 1. Load Secrets
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
+
+# 2. Setup MongoDB
 client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client["aqi_project_db"]
-collection = db["features"]
+collection = db["pollution_data"]
 
-# Setup Open-Meteo API Client
+# 3. Setup Open-Meteo API Client with Cache
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
 
-def fetch_latest_hour():
-    print("📡 Connecting to Open-Meteo for latest data...")
+def backfill_history():
+    print("📡 Connecting to Open-Meteo for historical data (Last 30 Days)...")
     
-    # 2. Coordinates for Karachi
+    # Coordinates for Karachi
     LAT = 24.8607
     LON = 67.0011
     
-    # We ask for "past_days=1" to ensure we get the most recent completed hour
-    url_aq = "https://air-quality-api.open-meteo.com/v1/air-quality"
-    params_aq = {
-        "latitude": LAT, "longitude": LON,
-        "hourly": ["pm2_5", "pm10", "nitrogen_dioxide"],
-        "past_days": 1
+    # Calculate Date Range (Last 30 Days)
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=30)
+
+    url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+    params = {
+        "latitude": LAT,
+        "longitude": LON,
+        "hourly": ["pm2_5", "pm10"],
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+        "timezone": "auto"
     }
     
-    url_w = "https://api.open-meteo.com/v1/forecast"
-    params_w = {
-        "latitude": LAT, "longitude": LON,
+    # Get Air Quality Data
+    aq_responses = openmeteo.weather_api(url, params=params)
+    response = aq_responses[0]
+
+    # Process Hourly Data
+    hourly = response.Hourly()
+    pm25 = hourly.Variables(0).ValuesAsNumpy()
+    pm10 = hourly.Variables(1).ValuesAsNumpy()
+    
+    # --- FETCH WEATHER DATA (Temp, Humidity, Wind) ---
+    weather_url = "https://api.open-meteo.com/v1/forecast"
+    weather_params = {
+        "latitude": LAT,
+        "longitude": LON,
         "hourly": ["temperature_2m", "relative_humidity_2m", "wind_speed_10m"],
-        "past_days": 1
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+        "timezone": "auto"
     }
+    
+    weather_responses = openmeteo.weather_api(weather_url, params=weather_params)
+    w_response = weather_responses[0]
+    w_hourly = w_response.Hourly()
+    
+    temp = w_hourly.Variables(0).ValuesAsNumpy()
+    humidity = w_hourly.Variables(1).ValuesAsNumpy()
+    wind_speed = w_hourly.Variables(2).ValuesAsNumpy()
 
-    try:
-        # Fetch Air Quality
-        aq_resp = openmeteo.weather_api(url_aq, params=params_aq)[0]
-        hourly_aq = aq_resp.Hourly()
-        
-        # Fetch Weather
-        w_resp = openmeteo.weather_api(url_w, params=params_w)[0]
-        hourly_w = w_resp.Hourly()
+    # --- 🛠️ BULLETPROOF ALIGNMENT FIX ---
+    # We use the length of the 'pm25' array to define how many timestamps we need.
+    # This prevents the "Arrays must be same length" error.
+    
+    # 1. Generate Timestamps
+    start_ts = pd.to_datetime(hourly.Time(), unit="s", utc=True)
+    interval = hourly.Interval()
+    n_points = len(pm25) # Trust the data length
+    
+    timestamps = pd.date_range(start=start_ts, periods=n_points, freq=f"{interval}s")
 
-        # 3. Create DataFrame
-        dates = pd.date_range(
-            start=pd.to_datetime(hourly_aq.Time(), unit="s", utc=True),
-            end=pd.to_datetime(hourly_aq.TimeEnd(), unit="s", utc=True),
-            freq=pd.Timedelta(seconds=hourly_aq.Interval()),
-            inclusive="left"
-        )
-        
-        df = pd.DataFrame({
-            "timestamp": dates,
-            "pm2_5": hourly_aq.Variables(0).ValuesAsNumpy(),
-            "pm10": hourly_aq.Variables(1).ValuesAsNumpy(),
-            "no2": hourly_aq.Variables(2).ValuesAsNumpy(),
-            "temp": hourly_w.Variables(0).ValuesAsNumpy(),
-            "humidity": hourly_w.Variables(1).ValuesAsNumpy(),
-            "wind_speed": hourly_w.Variables(2).ValuesAsNumpy()
-        })
-        
-        # 4. Filter for ONLY the current/latest hour
-        # We grab the last row that isn't in the future
-        now = pd.Timestamp.now(tz='UTC')
-        current_data = df[df['timestamp'] <= now].iloc[-1:]
-        
-        current_data["hour"] = current_data["timestamp"].dt.hour
-        
-        # 5. Push to MongoDB (Append Mode)
-        if not current_data.empty:
-            record = current_data.to_dict("records")[0]
-            
-            # Upsert: Update if exists, Insert if new (prevents duplicates)
-            collection.update_one(
+    # 2. Create DataFrame safely
+    # Note: We slice all arrays [:n_points] just in case weather api returns 1 extra hour
+    df = pd.DataFrame({
+        "timestamp": timestamps,
+        "pm2_5": pm25,
+        "pm10": pm10,
+        "temp": temp[:n_points],
+        "humidity": humidity[:n_points],
+        "wind_speed": wind_speed[:n_points]
+    })
+    
+    # 3. Add derived features
+    df["timestamp"] = df["timestamp"].dt.tz_localize(None) # Remove timezone for Mongo
+    df["hour"] = df["timestamp"].dt.hour
+    
+    # 4. Upload to MongoDB
+    data_dict = df.to_dict("records")
+    
+    if data_dict:
+        # Use bulk write to avoid duplicates
+        operations = [
+            pymongo.UpdateOne(
                 {"timestamp": record["timestamp"]}, 
                 {"$set": record}, 
                 upsert=True
             )
-            print(f"✅ Successfully added data for: {record['timestamp']}")
-        else:
-            print("⚠️ No valid past data found in response.")
-
-    except Exception as e:
-        print(f"❌ Error in feature pipeline: {e}")
+            for record in data_dict
+        ]
+        result = collection.bulk_write(operations)
+        print(f"✅ Backfill Complete: {len(data_dict)} records processed!")
+        print(f"   (Inserted/Updated: {result.upserted_count + result.modified_count})")
+    else:
+        print("⚠️ No data found to insert.")
 
 if __name__ == "__main__":
-    fetch_latest_hour()
+    try:
+        backfill_history()
+    except Exception as e:
+        print(f"❌ Error in backfill: {e}")

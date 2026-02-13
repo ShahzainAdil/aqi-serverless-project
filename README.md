@@ -2,27 +2,30 @@
 
 ![Status](https://img.shields.io/badge/Status-Live-success)
 ![Python](https://img.shields.io/badge/Python-3.9-blue)
-![Accuracy](https://img.shields.io/badge/Model%20Accuracy-92%25-green)
+![Pipeline](https://img.shields.io/badge/Pipeline-Automated-orange)
 
 ## 🚀 Live Demo
 **[Click here to launch the Dashboard](https://aqi-serverless-project-csvcfw6mjcsappwnxkupxds.streamlit.app/)**
 
 ## 📖 Project Overview
-This project is an **End-to-End Serverless Machine Learning Pipeline** that predicts Air Quality (AQI & PM2.5) in Karachi for the next 72 hours. Unlike static notebooks, this system runs autonomously in the cloud, fetching live data, retraining models, and updating the dashboard without manual intervention.
+This project is an **End-to-End Serverless Machine Learning Pipeline** that predicts Air Quality (AQI & PM2.5) in Karachi for the next 72 hours. Unlike static notebooks, this system runs autonomously in the cloud, utilizing a robust feature engineering pipeline, automated retraining, and a real-time dashboard with historical analysis.
 
-### 🏗️ Serverless Architecture
-The system follows a modern MLOps architecture using **GitHub Actions** and **MongoDB Atlas**:
+### 🏗️ Architecture & Features
 
-1.  **🤖 Data Collector (Hourly Robot):** * Wakes up every **hour** (via GitHub Actions cron).
-    * Fetches real-time weather & pollution data from Open-Meteo APIs.
-    * Updates the **MongoDB Atlas** feature store.
-2.  **🧠 Model Trainer (Daily Robot):** * Wakes up every **24 hours**.
-    * Retrains 3 models (Random Forest, XGBoost, Linear Reg).
-    * Evaluates them using **RMSE** and **R² Score**.
-    * Saves the "Champion Model" to the registry.
-3.  **📊 User Interface (Streamlit):** * A live dashboard that loads the champion model.
-    * Visualizes forecasts using interactive Altair charts.
-    * Converts raw PM2.5 data into human-readable **AQI Scores**.
+#### 1. 🤖 Feature Pipeline (Data Engineering)
+* **Automated Collection:** Fetches raw weather and pollutant data from **Open-Meteo APIs** every hour.
+* **Feature Engineering:** Computes time-based features and derives critical metrics like wind-speed interactions.
+* **Storage:** Stores processed features in a **MongoDB Atlas** Feature Store.
+* **Historical Backfill:** Includes a specialized script to fetch and process past data (30+ days) for robust training.
+
+#### 2. 🧠 Training Pipeline (AutoML)
+* **Daily Retraining:** Wakes up every **24 hours** via GitHub Actions to retrain models on the latest data.
+* **Model Tournament:** Automatically trains and compares multiple algorithms (Random Forest, Gradient Boosting, Linear Regression).
+* **Dynamic Evaluation:** The system automatically promotes the model with the best RMSE score to "Champion" status.
+
+#### 3. 📊 Dashboard & Analytics
+* **Live Forecast:** Visualizes AQI predictions for the next 3 days.
+* **Exploratory Data Analysis (EDA):** A dedicated tab for analyzing historical pollution trends and correlations (e.g., Wind Speed vs. PM2.5).
 
 ## 🛠️ Tech Stack
 * **Language:** Python 3.9
@@ -31,11 +34,16 @@ The system follows a modern MLOps architecture using **GitHub Actions** and **Mo
 * **Orchestration:** GitHub Actions (CI/CD & Cron Jobs)
 * **Frontend:** Streamlit Cloud
 
-## 📈 Model Performance
-The current champion model (**Random Forest**) achieves:
-* **R² Score:** 92.0%
-* **MAE:** ±2.63 µg/m³
-* **RMSE:** ±3.59 µg/m³
+## 📈 Model Performance (Benchmark)
+*Current Champion: Random Forest Regressor*
+
+| Metric | Typical Score | Description |
+| :--- | :--- | :--- |
+| **R² Score** | **~92.0%** | Explains 92% of the variance in pollution levels. |
+| **MAE** | **±2.63** | Average error in PM2.5 units. |
+| **RMSE** | **±3.59** | Root Mean Square Error. |
+
+*> **Note:** Since this system retrains daily on new real-world data, these metrics may fluctuate slightly over time.*
 
 ---
 *Built by Shahzain*
