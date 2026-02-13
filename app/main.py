@@ -36,13 +36,13 @@ def load_model_data():
         return None, None, {}, []
     
     model = pickle.loads(model_doc["model_binary"])
+    # We retrieve the 'leaderboard' field we saved during training
     return model, model_doc["model_name"], model_doc.get("metrics", {}), model_doc.get("leaderboard", [])
 
 def get_latest_actual_pm25():
-    """Fetches the most recent actual PM2.5 reading from DB to start the forecast loop."""
     latest = db["pollution_data"].find_one(sort=[("timestamp", -1)])
     if latest:
-        return latest.get("pm2_5", 50.0) # Default to 50 if missing
+        return latest.get("pm2_5", 50.0)
     return 50.0 
 
 def get_weather_forecast():
@@ -88,55 +88,76 @@ with tab1:
     forecast_df = get_weather_forecast()
     
     if not forecast_df.empty and model:
-        # --- 🔁 RECURSIVE FORECASTING LOOP ---
+        # Recursive Loop
         current_lag = get_latest_actual_pm25()
         predictions = []
-        
         for index, row in forecast_df.iterrows():
-            input_data = pd.DataFrame({
-                "temp": [row["temp"]],
-                "humidity": [row["humidity"]],
-                "wind_speed": [row["wind_speed"]],
-                "hour": [row["hour"]],
-                "pm2_5_lag1": [current_lag] 
-            })
+            input_data = pd.DataFrame({"temp": [row["temp"]], "humidity": [row["humidity"]], "wind_speed": [row["wind_speed"]], "hour": [row["hour"]], "pm2_5_lag1": [current_lag]})
             pred = model.predict(input_data)[0]
             predictions.append(pred)
-            current_lag = pred # Update lag for next loop
+            current_lag = pred
             
         forecast_df["Predicted_PM25"] = predictions
         forecast_df["Predicted_AQI"] = forecast_df["Predicted_PM25"].apply(calculate_aqi)
         
+        # 📈 Forecast Chart
+        st.subheader("72-Hour Prediction")
         st.altair_chart(alt.Chart(forecast_df).mark_area(line={'color':'#FF4B4B'}, color=alt.Gradient(gradient='linear', stops=[alt.GradientStop(color='#FF4B4B', offset=0), alt.GradientStop(color='white', offset=1)], x1=1, x2=1, y1=1, y2=0)).encode(x='timestamp:T', y='Predicted_AQI:Q').properties(height=300), use_container_width=True)
         
-        avg_aqi = forecast_df["Predicted_AQI"].mean()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Avg Forecast AQI", f"{avg_aqi:.0f}")
-        c2.metric("Peak AQI", f"{forecast_df['Predicted_AQI'].max():.0f}")
-        status = "Good 🌳" if avg_aqi <= 50 else "Moderate 😐" if avg_aqi <= 100 else "Unhealthy 😷"
-        c3.info(f"Status: {status}")
+        # 📊 NEW: Forecast Data Statistics
+        st.subheader("📋 Forecast Data Statistics")
+        col_stats, col_table = st.columns([1, 2])
+        
+        with col_stats:
+            # Summary Metrics
+            avg_aqi = forecast_df["Predicted_AQI"].mean()
+            max_aqi = forecast_df["Predicted_AQI"].max()
+            min_aqi = forecast_df["Predicted_AQI"].min()
+            
+            st.metric("Average Forecasted AQI", f"{avg_aqi:.1f}")
+            st.metric("Highest Peak", f"{max_aqi:.1f}")
+            st.metric("Lowest Point", f"{min_aqi:.1f}")
+            
+            status = "Good 🌳" if avg_aqi <= 50 else "Moderate 😐" if avg_aqi <= 100 else "Unhealthy 😷"
+            st.info(f"**Expected Air Quality:** {status}")
+
+        with col_table:
+            # Raw table with filter
+            st.write("Full Forecast Table (Next 72 Hours)")
+            st.dataframe(forecast_df[["timestamp", "temp", "wind_speed", "Predicted_AQI"]].set_index("timestamp"), height=250)
 
 # --- TAB 2: HISTORY ---
 with tab2:
     hist_df = get_historical_data()
     if not hist_df.empty:
         st.subheader("Pollution Trend (Last 30 Days)")
-        
-        # 1. Line Chart (Trend)
-        chart_trend = alt.Chart(hist_df).mark_line().encode(
-            x=alt.X('timestamp:T', title='Time'), 
-            y=alt.Y('pm2_5:Q', title='PM2.5')
-        ).properties(height=300)
-        
+        chart_trend = alt.Chart(hist_df).mark_line().encode(x='timestamp:T', y='pm2_5:Q').properties(height=300)
         st.altair_chart(chart_trend, use_container_width=True)
         
         st.subheader("Correlations")
-        
-        # 2. Scatter Chart (Wind vs Pollution)
-        chart_corr = alt.Chart(hist_df).mark_circle().encode(
-            x=alt.X('wind_speed:Q', title='Wind Speed'), 
-            y=alt.Y('pm2_5:Q', title='PM2.5'), 
-            color='temp:Q'
-        ).properties(height=300)
-        
+        chart_corr = alt.Chart(hist_df).mark_circle().encode(x='wind_speed:Q', y='pm2_5:Q', color='temp:Q').properties(height=300)
         st.altair_chart(chart_corr, use_container_width=True)
+
+# --- TAB 3: MODEL TOURNAMENT (FIXED!) ---
+with tab3:
+    st.header("🥊 Model Tournament Leaderboard")
+    st.markdown("Every 24 hours, the system retrains three different models on the latest data and selects the champion based on the lowest RMSE.")
+    
+    if leaderboard:
+        # Create a DataFrame from the leaderboard data
+        lb_df = pd.DataFrame(leaderboard)
+        
+        # Sort so the best model (lowest RMSE) is at the top
+        lb_df = lb_df.sort_values("rmse", ascending=True)
+        
+        # Format for display
+        lb_df["r2"] = lb_df["r2"].apply(lambda x: f"{x*100:.2f}%")
+        lb_df["rmse"] = lb_df["rmse"].apply(lambda x: f"{x:.4f}")
+        lb_df["mae"] = lb_df["mae"].apply(lambda x: f"{x:.4f}")
+        
+        # Display table
+        st.table(lb_df.set_index("model"))
+        
+        st.success(f"🏆 The current champion is **{model_name}**.")
+    else:
+        st.warning("⚠️ No leaderboard data found. Run your training pipeline once to generate these statistics.")
