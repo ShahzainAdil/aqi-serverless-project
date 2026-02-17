@@ -35,13 +35,13 @@ This project is an **End-to-End Serverless Machine Learning Pipeline** that pred
 * **Frontend:** Streamlit Cloud
 
 ## 📈 Model Performance (Benchmark)
-*Current Champion: Random Forest Regressor*
+*Current Champion: Linear Regressor*
 
 | Metric | Typical Score | Description |
 | :--- | :--- | :--- |
-| **R² Score** | **~92.0%** | Explains 92% of the variance in pollution levels. |
-| **MAE** | **±2.63** | Average error in PM2.5 units. |
-| **RMSE** | **±3.59** | Root Mean Square Error. |
+| **R² Score** | **~80.0%** | Explains 80% of the variance in pollution levels. |
+| **MAE** | **±3.22** | Average error in PM2.5 units. |
+| **RMSE** | **±5.0** | Root Mean Square Error. |
 
 *> **Note:** Since this system retrains daily on new real-world data, these metrics may fluctuate slightly over time.*
 
